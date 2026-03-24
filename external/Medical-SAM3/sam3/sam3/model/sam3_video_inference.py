@@ -7,6 +7,10 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+
+SAM3_AMP_DTYPE = (
+    torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+)
 import torch.distributed as dist
 import torch.nn.functional as F
 from sam3 import perflib
@@ -798,7 +802,7 @@ class Sam3VideoInference(Sam3VideoBase):
         return inference_state
 
     @torch.inference_mode()
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @torch.autocast(device_type="cuda", dtype=SAM3_AMP_DTYPE)
     def warm_up_compilation(self):
         """
         Warm up the model by running a dummy inference to compile the model. This is
@@ -906,7 +910,7 @@ class Sam3VideoInference(Sam3VideoBase):
         )
         return frame_idx, self._postprocess_output(inference_state, out)
 
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @torch.autocast(device_type="cuda", dtype=SAM3_AMP_DTYPE)
     def forward(self, input: BatchedDatapoint, is_inference: bool = False):
         """This method is only used for benchmark eval (not used in the demo)."""
         # set the model to single GPU for benchmark evaluation (to be compatible with trainer)

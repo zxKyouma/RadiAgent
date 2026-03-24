@@ -8,6 +8,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+SAM3_AMP_DTYPE = (
+    torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+)
 from sam3.model.model_misc import SAM3Output
 from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor
 from sam3.model.vl_combiner import SAM3VLBackbone
@@ -833,7 +837,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             assert len(feats["backbone_fpn"]) == 3  # SAM2 backbone always have 3 levels
             # cast the SAM2 backbone features to bfloat16 for all-gather (this is usually
             # a no-op, SAM2 backbone features are likely already in bfloat16 due to AMP)
-            backbone_fpn_bf16 = [x.to(torch.bfloat16) for x in feats["backbone_fpn"]]
+            backbone_fpn_bf16 = [x.to(SAM3_AMP_DTYPE) for x in feats["backbone_fpn"]]
             fpn0, fpn_handle0 = self._gather_tensor(backbone_fpn_bf16[0])
             fpn1, fpn_handle1 = self._gather_tensor(backbone_fpn_bf16[1])
             fpn2, fpn_handle2 = self._gather_tensor(backbone_fpn_bf16[2])

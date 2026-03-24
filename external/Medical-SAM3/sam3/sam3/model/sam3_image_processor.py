@@ -18,16 +18,8 @@ class Sam3Processor:
         self.model = model
         self.resolution = resolution
         self.device = device
-        self.transform = v2.Compose(
-            [
-                v2.ToDtype(torch.uint8, scale=True),
-                v2.Resize(size=(resolution, resolution)),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        self.transform = None
         self.confidence_threshold = confidence_threshold
-
         self.find_stage = FindStage(
             img_ids=torch.tensor([0], device=device, dtype=torch.long),
             text_ids=torch.tensor([0], device=device, dtype=torch.long),
@@ -37,6 +29,38 @@ class Sam3Processor:
             input_points=None,
             input_points_mask=None,
         )
+
+    def _to_image_tensor(self, image) -> torch.Tensor:
+        if isinstance(image, PIL.Image.Image):
+            arr = np.array(image)
+        elif isinstance(image, np.ndarray):
+            arr = image
+        elif isinstance(image, torch.Tensor):
+            tensor = image
+            if tensor.ndim == 3 and tensor.shape[0] in (1, 3):
+                return tensor.to(self.device)
+            if tensor.ndim == 3 and tensor.shape[-1] in (1, 3):
+                return tensor.permute(2, 0, 1).to(self.device)
+            raise ValueError('Unsupported tensor image shape')
+        else:
+            raise ValueError('Image must be a PIL image, numpy array, or tensor')
+
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        if arr.ndim != 3 or arr.shape[-1] not in (1, 3):
+            raise ValueError('Unsupported image array shape')
+        tensor = torch.from_numpy(arr)
+        if tensor.ndim == 3:
+            tensor = tensor.permute(2, 0, 1)
+        return tensor.to(self.device)
+
+    def _preprocess_image(self, image: torch.Tensor) -> torch.Tensor:
+        image = image.to(torch.float32) / 255.0
+        image = v2.functional.resize(image, size=[self.resolution, self.resolution])
+        image = v2.functional.normalize(
+            image, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+        )
+        return image
 
     @torch.inference_mode()
     def set_image(self, image, state=None):
@@ -51,8 +75,8 @@ class Sam3Processor:
         else:
             raise ValueError("Image must be a PIL image or a tensor")
 
-        image = v2.functional.to_image(image).to(self.device)
-        image = self.transform(image).unsqueeze(0)
+        image = self._to_image_tensor(image)
+        image = self._preprocess_image(image).unsqueeze(0)
 
         state["original_height"] = height
         state["original_width"] = width
@@ -89,7 +113,7 @@ class Sam3Processor:
         state["original_widths"] = [image.width for image in images]
 
         images = [
-            self.transform(v2.functional.to_image(image).to(self.device))
+            self._preprocess_image(self._to_image_tensor(image))
             for image in images
         ]
         images = torch.stack(images, dim=0)

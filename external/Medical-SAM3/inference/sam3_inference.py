@@ -5,14 +5,18 @@ Supports both box prompt and text prompt inference.
 
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+SAM3_AMP_DTYPE = (
+    torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+)
 from PIL import Image
 
 # Add SAM3 to path - update this to your SAM3 installation directory
-SAM3_ROOT = Path("../sam3")
+SAM3_ROOT = Path(__file__).resolve().parent.parent / "sam3"
 sys.path.insert(0, str(SAM3_ROOT))
 
 from sam3 import build_sam3_image_model
@@ -60,7 +64,7 @@ class SAM3Model:
         torch.backends.cudnn.allow_tf32 = True
 
         # Use bfloat16 for inference
-        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+        torch.autocast("cuda", dtype=SAM3_AMP_DTYPE).__enter__()
 
         # Load model
         bpe_path = SAM3_ROOT / "assets" / "bpe_simple_vocab_16e6.txt.gz"
@@ -154,6 +158,81 @@ class SAM3Model:
 
         return inference_state
 
+    def _collect_candidates(
+        self,
+        prompt_state: dict,
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Collect ranked prompt candidates with scores, boxes, and masks."""
+        masks = prompt_state.get("masks")
+        scores = prompt_state.get("scores")
+        boxes = prompt_state.get("boxes")
+
+        if masks is None or scores is None or len(scores) == 0:
+            return []
+
+        scores_cpu = scores.detach().float().cpu()
+        boxes_cpu = boxes.detach().float().cpu() if boxes is not None else None
+        order = torch.argsort(scores_cpu, descending=True)
+        if top_k is not None:
+            order = order[:top_k]
+
+        candidates: List[Dict[str, Any]] = []
+        for rank, idx in enumerate(order.tolist(), start=1):
+            mask = np.asarray(masks[idx].detach().cpu().numpy())
+            mask = np.squeeze(mask).astype(bool)
+            bbox_xyxy = None
+            if boxes_cpu is not None:
+                bbox_xyxy = tuple(float(x) for x in boxes_cpu[idx].tolist())
+            else:
+                bbox_xyxy = generate_bbox_from_mask(mask.astype(np.uint8))
+            candidates.append(
+                {
+                    "rank": rank,
+                    "index": idx,
+                    "score": float(scores_cpu[idx].item()),
+                    "area_px": int(mask.sum()),
+                    "bbox_xyxy": bbox_xyxy,
+                    "mask": mask.astype(np.uint8),
+                }
+            )
+
+        return candidates
+
+    def predict_box_candidates(
+        self,
+        inference_state: dict,
+        bbox: Tuple[int, int, int, int],
+        img_size: Tuple[int, int],
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run a box prompt and return ranked candidates."""
+        self.processor.reset_all_prompts(inference_state)
+
+        x_min, y_min, x_max, y_max = bbox
+        img_h, img_w = img_size
+
+        # Convert to xywh format
+        width = x_max - x_min
+        height = y_max - y_min
+
+        # Convert xywh to cxcywh
+        box_xywh = torch.tensor([x_min, y_min, width, height], dtype=torch.float32).view(1, 4)
+        box_cxcywh = box_xywh_to_cxcywh(box_xywh)
+
+        # Normalize to [0, 1]
+        norm_box = normalize_bbox(box_cxcywh, img_w, img_h).flatten().tolist()
+
+        box_state = self.processor.add_geometric_prompt(
+            state=inference_state,
+            box=norm_box,
+            label=True,
+        )
+        candidates = self._collect_candidates(box_state, top_k=top_k)
+        for candidate in candidates:
+            candidate["prompt_bbox_xyxy"] = tuple(float(x) for x in bbox)
+        return candidates
+
     def predict_box(
         self,
         inference_state: dict,
@@ -171,35 +250,34 @@ class SAM3Model:
         Returns:
             Binary prediction mask or None if no prediction
         """
+        candidates = self.predict_box_candidates(
+            inference_state=inference_state,
+            bbox=bbox,
+            img_size=img_size,
+            top_k=1,
+        )
+        if not candidates:
+            return None
+
+        return candidates[0]["mask"][None, ...].astype(np.uint8)
+
+    def predict_text_candidates(
+        self,
+        inference_state: dict,
+        text_prompt: str,
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run text prompting and return ranked candidate boxes and masks."""
         self.processor.reset_all_prompts(inference_state)
 
-        x_min, y_min, x_max, y_max = bbox
-        img_h, img_w = img_size
-
-        # Convert to xywh format
-        width = x_max - x_min
-        height = y_max - y_min
-
-        # Convert xywh to cxcywh
-        box_xywh = torch.tensor([x_min, y_min, width, height], dtype=torch.float32).view(1, 4)
-        box_cxcywh = box_xywh_to_cxcywh(box_xywh)
-
-        # Normalize to [0, 1]
-        norm_box = normalize_bbox(box_cxcywh, img_w, img_h).flatten().tolist()
-
-        # Run inference
-        box_state = self.processor.add_geometric_prompt(
+        text_state = self.processor.set_text_prompt(
             state=inference_state,
-            box=norm_box,
-            label=True  # Positive prompt
+            prompt=text_prompt
         )
-
-        if box_state["masks"] is not None and len(box_state["masks"]) > 0:
-            best_idx = torch.argmax(box_state["scores"]).item()
-            pred_mask = box_state["masks"][best_idx].cpu().numpy() > 0
-            return pred_mask.astype(np.uint8)
-
-        return None
+        candidates = self._collect_candidates(text_state, top_k=top_k)
+        for candidate in candidates:
+            candidate["prompt"] = text_prompt
+        return candidates
 
     def predict_text(
         self,
@@ -216,20 +294,15 @@ class SAM3Model:
         Returns:
             Binary prediction mask or None if no prediction
         """
-        self.processor.reset_all_prompts(inference_state)
-
-        # Run text-prompted inference
-        text_state = self.processor.set_text_prompt(
-            state=inference_state,
-            prompt=text_prompt
+        candidates = self.predict_text_candidates(
+            inference_state=inference_state,
+            text_prompt=text_prompt,
+            top_k=1,
         )
+        if not candidates:
+            return None
 
-        if text_state["masks"] is not None and len(text_state["masks"]) > 0:
-            best_idx = torch.argmax(text_state["scores"]).item()
-            pred_mask = text_state["masks"][best_idx].cpu().numpy() > 0
-            return pred_mask.astype(np.uint8)
-
-        return None
+        return candidates[0]["mask"][None, ...].astype(np.uint8)
 
     def get_confidence(self, state: dict) -> float:
         """Get confidence score from state."""

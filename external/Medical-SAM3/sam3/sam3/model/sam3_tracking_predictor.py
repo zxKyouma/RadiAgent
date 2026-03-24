@@ -6,6 +6,10 @@ import logging
 from collections import OrderedDict
 
 import torch
+
+SAM3_AMP_DTYPE = (
+    torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+)
 from sam3.model.sam3_tracker_base import concat_points, NO_OBJ_SCORE, Sam3TrackerBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.utils.sam2_utils import load_video_frames
@@ -47,7 +51,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.max_point_num_in_prompt_enc = max_point_num_in_prompt_enc
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
 
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        self.bf16_context = torch.autocast(device_type="cuda", dtype=SAM3_AMP_DTYPE)
         self.bf16_context.__enter__()  # keep using for the entire model process
 
         self.iter_use_prev_mask_pred = True
@@ -1094,7 +1098,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         storage_device = inference_state["storage_device"]
         maskmem_features = current_out["maskmem_features"]
         if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16)
+            maskmem_features = maskmem_features.to(SAM3_AMP_DTYPE)
             maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         pred_masks_gpu = current_out["pred_masks"]
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
@@ -1145,7 +1149,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
 
         # optionally offload the output to CPU memory to save GPU space
         storage_device = inference_state["storage_device"]
-        maskmem_features = maskmem_features.to(torch.bfloat16)
+        maskmem_features = maskmem_features.to(SAM3_AMP_DTYPE)
         maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(

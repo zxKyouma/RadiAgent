@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from sam3_inference import SAM3Model
+if TYPE_CHECKING:
+    from sam3_inference import SAM3Model
+else:
+    SAM3Model = Any
 
-from .orchestrator import CandidateSelector, FindingExtractor, ProposalGenerator, SegmentationRefiner
+from .orchestrator import BoxProposer, CandidateSelector, FindingExtractor, Localizer, SegmentationRefiner
 from .scoring import bbox_iou, compute_box_rerank_score, compute_mask_metrics, compute_text_rerank_score, lesion_size_prior
-from .types import FindingTarget, ProposalCandidate, SegmentationSelection, StudyContext
+from .types import BoxProposal, LocalizerHypothesis, ProposalCandidate, SegmentationSelection, StructuredTarget, StudyContext
 
 
 DEFAULT_BRAIN_MRI_PROMPTS = [
@@ -48,8 +51,20 @@ class BrainMriVisualConfig:
     proposal_prompt: str = 'visual enhancement candidate'
 
 
+@dataclass(slots=True)
+class BrainMriHeuristicLocalizerConfig:
+    slice_radius: int = 2
+    coarse_stride: int = 4
+    shortlist_size: int = 3
+    thresholds: Sequence[float] = (0.985, 0.99, 0.995)
+    min_component_px: int = 12
+    max_component_frac: float = 0.03
+    min_center_separation: int = 3
+    laterality_bonus: float = 0.1
+
+
 class BrainMriFindingExtractor(FindingExtractor):
-    def extract(self, context: StudyContext) -> FindingTarget:
+    def extract(self, context: StudyContext) -> StructuredTarget:
         normalized = context.report_text.lower()
         laterality = 'unknown'
         if 'left' in normalized:
@@ -58,7 +73,7 @@ class BrainMriFindingExtractor(FindingExtractor):
             laterality = 'right'
         finding = context.metadata.get('finding_text') or 'intracranial mass'
         sub_anatomy = context.metadata.get('sub_anatomy')
-        return FindingTarget(
+        return StructuredTarget(
             finding=str(finding),
             anatomy='brain',
             laterality=laterality,
@@ -72,18 +87,135 @@ class BrainMriFindingExtractor(FindingExtractor):
         )
 
 
-class BrainMriTextProposalGenerator(ProposalGenerator):
+class MetadataWindowLocalizer(Localizer):
+    """Temporary localizer that reuses metadata-defined slice windows."""
+
+    def localize(self, context: StudyContext, target: StructuredTarget) -> List[LocalizerHypothesis]:
+        slice_indices = [int(idx) for idx in context.metadata.get('slice_indices', [])]
+        if not slice_indices:
+            return []
+        center_slice = int(context.metadata.get('mid_slice', slice_indices[len(slice_indices) // 2]))
+        return [
+            LocalizerHypothesis(
+                source='metadata_window',
+                score=1.0,
+                center_slice=center_slice,
+                slice_indices=slice_indices,
+                metadata={
+                    'case_id': context.case_id,
+                    'sequence': context.sequence,
+                },
+            )
+        ]
+
+
+class BrainMriHeuristicLocalizer(Localizer):
+    """Cheap image-only localizer that shortlists promising slice windows."""
+
+    def __init__(self, config: BrainMriHeuristicLocalizerConfig):
+        self.config = config
+
+    def localize(self, context: StudyContext, target: StructuredTarget) -> List[LocalizerHypothesis]:
+        depth = int(context.image_volume.shape[2])
+        centers = list(range(0, depth, max(1, int(self.config.coarse_stride))))
+        if not centers or centers[-1] != depth - 1:
+            centers.append(depth - 1)
+
+        scored_centers = [
+            (center, self._score_window(context.image_volume, center, target))
+            for center in centers
+        ]
+        scored_centers.sort(key=lambda item: item[1], reverse=True)
+
+        hypotheses: List[LocalizerHypothesis] = []
+        for center, score in scored_centers:
+            if score <= 0.0:
+                continue
+            if any(abs(center - existing.center_slice) < self.config.min_center_separation for existing in hypotheses):
+                continue
+            slice_indices = [
+                s
+                for s in range(center - self.config.slice_radius, center + self.config.slice_radius + 1)
+                if 0 <= s < depth
+            ]
+            hypotheses.append(
+                LocalizerHypothesis(
+                    source='heuristic_localizer',
+                    score=float(score),
+                    center_slice=int(center),
+                    slice_indices=slice_indices,
+                    metadata={
+                        'case_id': context.case_id,
+                        'sequence': context.sequence,
+                    },
+                )
+            )
+            if len(hypotheses) >= self.config.shortlist_size:
+                break
+        return hypotheses
+
+    def _score_window(self, image_volume: np.ndarray, center: int, target: StructuredTarget) -> float:
+        depth = int(image_volume.shape[2])
+        best_score = 0.0
+        for slice_idx in range(center - self.config.slice_radius, center + self.config.slice_radius + 1):
+            if slice_idx < 0 or slice_idx >= depth:
+                continue
+            slice_img = np.asarray(image_volume[:, :, slice_idx], dtype=np.float32)
+            slice_score = self._score_slice(slice_img, target)
+            if slice_score > best_score:
+                best_score = slice_score
+        return best_score
+
+    def _score_slice(self, slice_img: np.ndarray, target: StructuredTarget) -> float:
+        normalized = _normalize_slice(slice_img)
+        image_area = float(normalized.shape[0] * normalized.shape[1])
+        best_score = 0.0
+        for threshold in self.config.thresholds:
+            binary = normalized >= float(threshold)
+            for component_mask in _connected_components(binary):
+                area_px = int(component_mask.sum())
+                if area_px < self.config.min_component_px:
+                    continue
+                area_frac = area_px / image_area
+                if area_frac > self.config.max_component_frac:
+                    continue
+                bbox = _mask_to_bbox(component_mask)
+                if bbox is None:
+                    continue
+                bbox_area = max(float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])), 1.0)
+                fill_ratio = min(area_px / bbox_area, 1.0)
+                score = float(threshold) * (0.6 + 0.4 * fill_ratio)
+                if target.laterality in {'left', 'right'}:
+                    score += self._laterality_bonus(bbox, normalized.shape[1], target.laterality)
+                best_score = max(best_score, score)
+        return best_score
+
+    def _laterality_bonus(self, bbox: Tuple[int, int, int, int], width: int, laterality: str) -> float:
+        center_x = 0.5 * (bbox[0] + bbox[2])
+        if laterality == 'left' and center_x < width * 0.5:
+            return self.config.laterality_bonus
+        if laterality == 'right' and center_x >= width * 0.5:
+            return self.config.laterality_bonus
+        return 0.0
+
+
+class BrainMriTextProposalGenerator(BoxProposer):
     def __init__(self, model: SAM3Model, config: BrainMriTextConfig):
         self.model = model
         self.config = config
 
-    def generate(self, context: StudyContext, target: FindingTarget) -> List[ProposalCandidate]:
-        slice_indices = list(context.metadata['slice_indices'])
-        mid_slice = int(context.metadata['mid_slice'])
+    def propose(
+        self,
+        context: StudyContext,
+        target: StructuredTarget,
+        hypothesis: LocalizerHypothesis,
+    ) -> List[BoxProposal]:
+        slice_indices = list(hypothesis.slice_indices)
+        mid_slice = int(context.metadata.get('mid_slice', hypothesis.center_slice))
         gt_volume = context.metadata.get('ground_truth_mask')
         slice_cache = _ensure_slice_cache(context, self.model)
         image_area = int(context.image_volume.shape[0] * context.image_volume.shape[1])
-        candidates: List[ProposalCandidate] = []
+        proposals: List[BoxProposal] = []
 
         for slice_idx in slice_indices:
             gt_slice = None
@@ -111,62 +243,61 @@ class BrainMriTextProposalGenerator(ProposalGenerator):
                     print(f"  PROMPT {prompt!r}: {len(raw_candidates)} candidates")
 
                 for raw in raw_candidates:
-                    candidate = ProposalCandidate(
+                    proposal = BoxProposal(
                         slice_idx=slice_idx,
                         prompt=prompt,
                         rank=int(raw['rank']),
                         score=float(raw['score']),
                         bbox_xyxy=tuple(float(x) for x in raw['bbox_xyxy']),
                         area_px=int(raw['area_px']),
+                        source='text',
+                        hypothesis=hypothesis,
                         mask=np.asarray(raw['mask']),
-                    )
-                    candidate.metadata['generator'] = 'text'
-                    candidate.metadata['slice_offset'] = slice_idx - mid_slice
-                    candidate.area_frac = candidate.area_px / image_area
-                    candidate.size_prior = lesion_size_prior(
-                        candidate.area_frac,
-                        self.config.target_mask_frac,
-                        self.config.size_prior_strength,
+                        metadata={
+                            'generator': 'text',
+                            'slice_offset': slice_idx - mid_slice,
+                            'area_frac': int(raw['area_px']) / image_area,
+                        },
                     )
                     if gt_slice is not None:
-                        candidate.text_metrics = compute_mask_metrics(candidate.mask, gt_slice)
+                        proposal.metadata['text_metrics'] = compute_mask_metrics(proposal.mask, gt_slice)
                     if self.config.verbose:
-                        dice = candidate.text_metrics.dice if candidate.text_metrics else float('nan')
+                        metrics = proposal.metadata.get('text_metrics')
+                        dice = metrics.dice if metrics is not None else float('nan')
                         print(
                             '   ',
-                            f'rank={candidate.rank}',
-                            f'score={candidate.score:.4f}',
-                            f'area={candidate.area_px}',
-                            f'bbox={candidate.bbox_xyxy}',
-                            f'dice={dice:.4f}' if candidate.text_metrics else 'dice=n/a',
+                            f'rank={proposal.rank}',
+                            f'score={proposal.score:.4f}',
+                            f'area={proposal.area_px}',
+                            f'bbox={proposal.bbox_xyxy}',
+                            f'dice={dice:.4f}' if metrics is not None else 'dice=n/a',
                         )
-                    candidates.append(candidate)
+                    proposals.append(proposal)
 
-        if not candidates:
-            return []
-
-        cluster_candidates(candidates, self.config.cluster_iou)
-        for candidate in candidates:
-            candidate.rerank_score = compute_text_rerank_score(candidate)
-        return candidates
+        return proposals
 
 
-class BrainMriVisualProposalGenerator(ProposalGenerator):
+class BrainMriVisualProposalGenerator(BoxProposer):
     def __init__(self, config: BrainMriVisualConfig):
         self.config = config
 
-    def generate(self, context: StudyContext, target: FindingTarget) -> List[ProposalCandidate]:
-        slice_indices = list(context.metadata['slice_indices'])
-        mid_slice = int(context.metadata['mid_slice'])
+    def propose(
+        self,
+        context: StudyContext,
+        target: StructuredTarget,
+        hypothesis: LocalizerHypothesis,
+    ) -> List[BoxProposal]:
+        slice_indices = list(hypothesis.slice_indices)
+        mid_slice = int(context.metadata.get('mid_slice', hypothesis.center_slice))
         gt_volume = context.metadata.get('ground_truth_mask')
         image_area = int(context.image_volume.shape[0] * context.image_volume.shape[1])
-        candidates: List[ProposalCandidate] = []
+        proposals: List[BoxProposal] = []
 
         for slice_idx in slice_indices:
             slice_img = np.asarray(context.image_volume[:, :, slice_idx], dtype=np.float32)
             normalized = _normalize_slice(slice_img)
             gt_slice = gt_volume[:, :, slice_idx] > 0 if gt_volume is not None else None
-            slice_candidates: List[ProposalCandidate] = []
+            slice_proposals: List[BoxProposal] = []
 
             for threshold in self.config.thresholds:
                 binary = normalized >= float(threshold)
@@ -183,44 +314,41 @@ class BrainMriVisualProposalGenerator(ProposalGenerator):
                     bbox_area = max(float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])), 1.0)
                     fill_ratio = min(area_px / bbox_area, 1.0)
                     score = float(threshold) * (0.6 + 0.4 * fill_ratio)
-                    candidate = ProposalCandidate(
+                    proposal = BoxProposal(
                         slice_idx=slice_idx,
                         prompt=self.config.proposal_prompt,
                         rank=0,
                         score=score,
                         bbox_xyxy=tuple(float(x) for x in bbox),
                         area_px=area_px,
+                        source='visual',
+                        hypothesis=hypothesis,
                         mask=component_mask,
+                        metadata={
+                            'generator': 'visual',
+                            'visual_threshold': float(threshold),
+                            'slice_offset': slice_idx - mid_slice,
+                            'area_frac': area_frac,
+                            'bbox_fill_ratio': fill_ratio,
+                        },
                     )
-                    candidate.metadata['generator'] = 'visual'
-                    candidate.metadata['visual_threshold'] = float(threshold)
-                    candidate.metadata['slice_offset'] = slice_idx - mid_slice
-                    candidate.area_frac = area_frac
-                    candidate.size_prior = 1.0
-                    candidate.bbox_fill_ratio = fill_ratio
                     if gt_slice is not None:
-                        candidate.text_metrics = compute_mask_metrics(component_mask, gt_slice)
-                    slice_candidates.append(candidate)
+                        proposal.metadata['text_metrics'] = compute_mask_metrics(component_mask, gt_slice)
+                    slice_proposals.append(proposal)
 
-            if not slice_candidates:
+            if not slice_proposals:
                 continue
 
-            deduped: List[ProposalCandidate] = []
-            for candidate in sorted(slice_candidates, key=lambda c: (float(c.score), float(c.area_px)), reverse=True):
-                if any(bbox_iou(candidate.bbox_xyxy, existing.bbox_xyxy) >= 0.7 for existing in deduped):
+            deduped: List[BoxProposal] = []
+            for proposal in sorted(slice_proposals, key=lambda c: (float(c.score), float(c.area_px)), reverse=True):
+                if any(bbox_iou(proposal.bbox_xyxy, existing.bbox_xyxy) >= 0.7 for existing in deduped):
                     continue
-                deduped.append(candidate)
+                deduped.append(proposal)
                 if len(deduped) >= self.config.max_candidates_per_slice:
                     break
-            candidates.extend(deduped)
+            proposals.extend(deduped)
 
-        if not candidates:
-            return []
-
-        cluster_candidates(candidates, 0.3)
-        for candidate in candidates:
-            candidate.rerank_score = compute_text_rerank_score(candidate)
-        return candidates
+        return proposals
 
 
 class SamBoxRefiner(SegmentationRefiner):
@@ -231,12 +359,47 @@ class SamBoxRefiner(SegmentationRefiner):
     def refine(
         self,
         context: StudyContext,
-        target: FindingTarget,
-        candidates: Sequence[ProposalCandidate],
+        target: StructuredTarget,
+        proposals: Sequence[BoxProposal],
     ) -> List[ProposalCandidate]:
         slice_cache = _ensure_slice_cache(context, self.model)
         image_area = int(context.image_volume.shape[0] * context.image_volume.shape[1])
         gt_volume = context.metadata.get('ground_truth_mask')
+
+        candidates: List[ProposalCandidate] = []
+        for proposal in proposals:
+            candidate = ProposalCandidate(
+                slice_idx=proposal.slice_idx,
+                prompt=proposal.prompt,
+                rank=proposal.rank,
+                score=proposal.score,
+                bbox_xyxy=proposal.bbox_xyxy,
+                area_px=proposal.area_px,
+                mask=None if proposal.mask is None else np.asarray(proposal.mask),
+                metadata=dict(proposal.metadata),
+            )
+            candidate.metadata.setdefault('generator', proposal.source)
+            candidate.metadata['localizer_source'] = proposal.hypothesis.source
+            candidate.metadata['localizer_score'] = proposal.hypothesis.score
+            candidate.metadata['localizer_center_slice'] = proposal.hypothesis.center_slice
+            candidate.area_frac = float(candidate.metadata.get('area_frac', candidate.area_px / image_area))
+            candidate.size_prior = lesion_size_prior(
+                candidate.area_frac,
+                self.config.target_mask_frac,
+                self.config.size_prior_strength,
+            ) if proposal.source == 'text' else 1.0
+            candidate.bbox_fill_ratio = float(candidate.metadata.get('bbox_fill_ratio', 0.0)) or None
+            metrics = candidate.metadata.get('text_metrics')
+            if metrics is not None:
+                candidate.text_metrics = metrics
+            candidates.append(candidate)
+
+        if not candidates:
+            return []
+
+        cluster_candidates(candidates, self.config.cluster_iou)
+        for candidate in candidates:
+            candidate.rerank_score = compute_text_rerank_score(candidate)
 
         for candidate in candidates:
             shape = slice_cache['slice_shapes'][candidate.slice_idx]
@@ -245,7 +408,8 @@ class SamBoxRefiner(SegmentationRefiner):
             bbox_height = max(float(candidate.bbox_xyxy[3]) - float(candidate.bbox_xyxy[1]), 1e-6)
             bbox_area = float(bbox_width * bbox_height)
             candidate.metadata['bbox_area_px'] = bbox_area
-            candidate.bbox_fill_ratio = min(1.0, float(candidate.area_px) / bbox_area)
+            if candidate.bbox_fill_ratio is None:
+                candidate.bbox_fill_ratio = min(1.0, float(candidate.area_px) / bbox_area)
 
             refined = self.model.predict_box_candidates(
                 slice_cache['slice_states'][candidate.slice_idx],
@@ -287,7 +451,7 @@ class SamBoxRefiner(SegmentationRefiner):
                 text_trust_min_prompts=self.config.text_trust_min_prompts,
                 text_trust_boost=self.config.text_trust_boost,
             )
-        return list(candidates)
+        return candidates
 
 
 class HeuristicCandidateSelector(CandidateSelector):
@@ -301,7 +465,7 @@ class HeuristicCandidateSelector(CandidateSelector):
     def select(
         self,
         context: StudyContext,
-        target: FindingTarget,
+        target: StructuredTarget,
         candidates: Sequence[ProposalCandidate],
     ) -> Optional[SegmentationSelection]:
         if not candidates:
@@ -312,23 +476,34 @@ class HeuristicCandidateSelector(CandidateSelector):
         self.top_text_reranked = sorted(candidate_list, key=lambda c: float(c.rerank_score or 0.0), reverse=True)[:10]
         self.top_box_reranked = sorted(candidate_list, key=lambda c: float(c.box_rerank_score or 0.0), reverse=True)[:10]
 
+        for candidate in candidate_list:
+            candidate.metadata['selection_score'] = _selection_evidence_score(candidate)
+
         best_text = max(
             (candidate for candidate in candidate_list if candidate.metadata.get('generator') == 'text'),
-            key=lambda c: float(c.box_rerank_score or 0.0),
+            key=lambda c: float(c.metadata.get('selection_score', 0.0)),
             default=None,
         )
         best_visual = max(
             (candidate for candidate in candidate_list if candidate.metadata.get('generator') == 'visual'),
-            key=lambda c: float(c.box_rerank_score or 0.0),
+            key=lambda c: float(c.metadata.get('selection_score', 0.0)),
             default=None,
         )
 
-        selected = max(candidate_list, key=lambda c: float(c.box_rerank_score or 0.0))
-        strategy = 'text_then_box_rerank'
+        selected = max(candidate_list, key=lambda c: float(c.metadata.get('selection_score', 0.0)))
+        strategy = 'evidence_ranked_selection'
         if best_text is not None and best_visual is not None:
+            text_score = float(best_text.metadata.get('selection_score', 0.0))
+            visual_score = float(best_visual.metadata.get('selection_score', 0.0))
+            text_dice_proxy = 0.0 if best_text.refined_metrics is None else float(best_text.refined_metrics.dice)
+            visual_dice_proxy = 0.0 if best_visual.refined_metrics is None else float(best_visual.refined_metrics.dice)
             text_supported = best_text.cluster_slice_count >= 3 and best_text.cluster_prompt_count >= 3
-            text_close = float(best_text.box_rerank_score or 0.0) >= float(best_visual.box_rerank_score or 0.0) - 0.03
-            if text_supported and text_close:
+            visual_clearly_better = visual_score >= text_score - 0.03 and visual_dice_proxy >= max(0.5, text_dice_proxy + 0.25)
+            text_clearly_bad = text_dice_proxy <= 0.05
+            if visual_clearly_better and text_clearly_bad:
+                selected = best_visual
+                strategy = 'visual_promoted_over_bad_text'
+            elif text_supported and text_score >= visual_score - 0.03:
                 selected = best_text
                 strategy = 'text_preferred_with_visual_fallback'
             elif selected is best_visual:
@@ -417,6 +592,7 @@ def candidate_to_summary(candidate: ProposalCandidate) -> Dict[str, object]:
         'compactness_prior': candidate.compactness_prior,
         'text_trust_bonus': candidate.text_trust_bonus,
         'box_rerank_score': candidate.box_rerank_score,
+        'selection_score': candidate.metadata.get('selection_score'),
         'metadata': dict(candidate.metadata),
     }
     if candidate.text_metrics is not None:
@@ -444,17 +620,22 @@ def candidate_to_summary(candidate: ProposalCandidate) -> Dict[str, object]:
 
 def _ensure_slice_cache(context: StudyContext, model: SAM3Model) -> Dict[str, object]:
     cache = context.metadata.setdefault('slice_cache', {})
-    if cache.get('ready'):
+    slice_indices = context.metadata.get('slice_indices')
+    if slice_indices is None:
+        slice_indices = list(range(context.image_volume.shape[2]))
+    requested = tuple(int(idx) for idx in slice_indices)
+    if cache.get('ready') and cache.get('slice_indices') == requested:
         return cache
 
     slice_states: Dict[int, dict] = {}
     slice_shapes: Dict[int, Tuple[int, int]] = {}
-    for slice_idx in context.metadata['slice_indices']:
+    for slice_idx in requested:
         rgb = normalize_slice_to_rgb(context.image_volume[:, :, slice_idx])
         slice_states[slice_idx] = model.encode_image(rgb)
         slice_shapes[slice_idx] = rgb.shape[:2]
     cache['slice_states'] = slice_states
     cache['slice_shapes'] = slice_shapes
+    cache['slice_indices'] = requested
     cache['ready'] = True
     return cache
 
@@ -499,3 +680,36 @@ def _connected_components(binary: np.ndarray) -> List[np.ndarray]:
             component[np.asarray(ys), np.asarray(xs)] = True
             components.append(component)
     return components
+
+
+def _selection_evidence_score(candidate: ProposalCandidate) -> float:
+    refined_score = float(candidate.refined_score or 0.0)
+    compactness = float(candidate.compactness_prior or 0.0)
+    stability = float(candidate.refined_bbox_stability_iou or 0.0)
+    fill_ratio = float(candidate.refined_bbox_fill_ratio or candidate.bbox_fill_ratio or 0.0)
+    localizer_score = float(candidate.metadata.get('localizer_score', 0.0))
+    support_score = min(candidate.cluster_slice_count / 4.0, 1.0) + min(candidate.cluster_prompt_count / 4.0, 1.0)
+    support_score *= 0.05
+    text_bonus = float(candidate.text_trust_bonus or 0.0)
+
+    score = (
+        0.48 * refined_score
+        + 0.16 * stability
+        + 0.12 * compactness
+        + 0.07 * fill_ratio
+        + 0.07 * localizer_score
+        + support_score
+        + 0.05 * min(text_bonus, 1.0)
+    )
+
+    generator = str(candidate.metadata.get('generator', 'unknown'))
+    if generator == 'text':
+        if candidate.cluster_slice_count < 2 or candidate.cluster_prompt_count < 2:
+            score -= 0.05
+        if refined_score < 0.7 and stability < 0.55:
+            score -= 0.08
+    elif generator == 'visual':
+        if refined_score >= 0.75 and compactness >= 0.35:
+            score += 0.05
+
+    return float(score)

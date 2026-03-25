@@ -3,31 +3,51 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, Sequence
 
-from .types import FindingTarget, PipelineRunArtifacts, ProposalCandidate, SegmentationSelection, StudyContext
+from .types import (
+    BoxProposal,
+    LocalizerHypothesis,
+    PipelineRunArtifacts,
+    ProposalCandidate,
+    SegmentationSelection,
+    StructuredTarget,
+    StudyContext,
+)
 
 
 class FindingExtractor(Protocol):
     """Extracts normalized targets from report text or study metadata."""
 
-    def extract(self, context: StudyContext) -> FindingTarget:
+    def extract(self, context: StudyContext) -> StructuredTarget:
         ...
 
 
-class ProposalGenerator(Protocol):
-    """Produces candidate boxes or masks for a target on a study."""
+class Localizer(Protocol):
+    """Shortlists top-k study windows before any heavy refinement."""
 
-    def generate(self, context: StudyContext, target: FindingTarget) -> List[ProposalCandidate]:
+    def localize(self, context: StudyContext, target: StructuredTarget) -> List[LocalizerHypothesis]:
+        ...
+
+
+class BoxProposer(Protocol):
+    """Produces coarse per-slice box proposals inside a localization window."""
+
+    def propose(
+        self,
+        context: StudyContext,
+        target: StructuredTarget,
+        hypothesis: LocalizerHypothesis,
+    ) -> List[BoxProposal]:
         ...
 
 
 class SegmentationRefiner(Protocol):
-    """Refines a candidate proposal into a sharper segmentation result."""
+    """Refines coarse proposals into sharper segmentation results."""
 
     def refine(
         self,
         context: StudyContext,
-        target: FindingTarget,
-        candidates: Sequence[ProposalCandidate],
+        target: StructuredTarget,
+        proposals: Sequence[BoxProposal],
     ) -> List[ProposalCandidate]:
         ...
 
@@ -38,7 +58,7 @@ class CandidateSelector(Protocol):
     def select(
         self,
         context: StudyContext,
-        target: FindingTarget,
+        target: StructuredTarget,
         candidates: Sequence[ProposalCandidate],
     ) -> Optional[SegmentationSelection]:
         ...
@@ -49,22 +69,42 @@ class SegmentationPipeline:
     """Generic orchestration shell for report-guided segmentation."""
 
     finding_extractor: FindingExtractor
-    proposal_generators: Sequence[ProposalGenerator]
+    localizer: Localizer
+    box_proposers: Sequence[BoxProposer]
     refiner: SegmentationRefiner
     selector: CandidateSelector
 
     def run_detailed(self, context: StudyContext) -> PipelineRunArtifacts:
         target = self.finding_extractor.extract(context)
-        all_candidates: List[ProposalCandidate] = []
-        for generator in self.proposal_generators:
-            all_candidates.extend(generator.generate(context, target))
-        if not all_candidates:
-            return PipelineRunArtifacts(target=target, candidates=[], selection=None)
-        refined = self.refiner.refine(context, target, all_candidates)
+        if target.should_abstain:
+            return PipelineRunArtifacts(target=target)
+
+        localizer_hypotheses = self.localizer.localize(context, target)
+        if not localizer_hypotheses:
+            return PipelineRunArtifacts(target=target)
+
+        all_box_proposals: List[BoxProposal] = []
+        for hypothesis in localizer_hypotheses:
+            for proposer in self.box_proposers:
+                all_box_proposals.extend(proposer.propose(context, target, hypothesis))
+        if not all_box_proposals:
+            return PipelineRunArtifacts(target=target, localizer_hypotheses=list(localizer_hypotheses))
+
+        refined = self.refiner.refine(context, target, all_box_proposals)
         if not refined:
-            return PipelineRunArtifacts(target=target, candidates=[], selection=None)
+            return PipelineRunArtifacts(
+                target=target,
+                localizer_hypotheses=list(localizer_hypotheses),
+                box_proposals=list(all_box_proposals),
+            )
         selection = self.selector.select(context, target, refined)
-        return PipelineRunArtifacts(target=target, candidates=list(refined), selection=selection)
+        return PipelineRunArtifacts(
+            target=target,
+            localizer_hypotheses=list(localizer_hypotheses),
+            box_proposals=list(all_box_proposals),
+            candidates=list(refined),
+            selection=selection,
+        )
 
     def run(self, context: StudyContext) -> Optional[SegmentationSelection]:
         return self.run_detailed(context).selection

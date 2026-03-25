@@ -261,6 +261,49 @@ class SAM3Model:
 
         return candidates[0]["mask"][None, ...].astype(np.uint8)
 
+    def predict_point_candidates(
+        self,
+        inference_state: dict,
+        point_xy: Tuple[int, int],
+        img_size: Tuple[int, int],
+        positive: bool = True,
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run inference with a point prompt and return ranked candidates."""
+        self.processor.reset_all_prompts(inference_state)
+
+        x, y = point_xy
+        img_h, img_w = img_size
+        norm_point = [float(x) / max(img_w - 1, 1), float(y) / max(img_h - 1, 1)]
+        point_state = self.processor.add_point_prompt(
+            point=norm_point,
+            label=positive,
+            state=inference_state,
+        )
+        candidates = self._collect_candidates(point_state, top_k=top_k)
+        for candidate in candidates:
+            candidate["prompt_point_xy"] = (int(x), int(y))
+        return candidates
+
+    def predict_point(
+        self,
+        inference_state: dict,
+        point_xy: Tuple[int, int],
+        img_size: Tuple[int, int],
+        positive: bool = True,
+    ) -> Optional[np.ndarray]:
+        """Run inference with a point prompt in pixel coordinates."""
+        candidates = self.predict_point_candidates(
+            inference_state=inference_state,
+            point_xy=point_xy,
+            img_size=img_size,
+            positive=positive,
+            top_k=1,
+        )
+        if not candidates:
+            return None
+        return candidates[0]["mask"][None, ...].astype(np.uint8)
+
     def predict_text_candidates(
         self,
         inference_state: dict,

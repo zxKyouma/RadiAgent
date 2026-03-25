@@ -12,8 +12,8 @@ VoxelBBoxXYZXYZ = Tuple[int, int, int, int, int, int]
 
 
 @dataclass(slots=True)
-class FindingTarget:
-    """Normalized finding extracted from a report or other clinical metadata."""
+class StructuredTarget:
+    """Normalized clinical target extracted from report text or metadata."""
 
     finding: str
     anatomy: str
@@ -23,6 +23,40 @@ class FindingTarget:
     certainty: str = 'unknown'
     modality_hint: Optional[str] = None
     support_status: str = 'unknown'
+    prompt_terms: List[str] = field(default_factory=list)
+    location_hints: List[str] = field(default_factory=list)
+    should_abstain: bool = False
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+FindingTarget = StructuredTarget
+
+
+@dataclass(slots=True)
+class LocalizerHypothesis:
+    """Coarse study-level hypothesis used to narrow search before refinement."""
+
+    source: str
+    score: float
+    center_slice: int
+    slice_indices: List[int]
+    bbox_xyxy: Optional[BBoxXYXY] = None
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class BoxProposal:
+    """Coarse per-slice box proposal emitted inside a localization hypothesis."""
+
+    slice_idx: int
+    prompt: str
+    rank: int
+    score: float
+    bbox_xyxy: BBoxXYXY
+    area_px: int
+    source: str
+    hypothesis: LocalizerHypothesis
+    mask: Optional[np.ndarray] = None
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
@@ -110,9 +144,11 @@ class VolumeAssembly:
 class PipelineRunArtifacts:
     """Detailed artifacts emitted by the generic orchestration shell."""
 
-    target: FindingTarget
-    candidates: List[ProposalCandidate]
-    selection: Optional[SegmentationSelection]
+    target: StructuredTarget
+    localizer_hypotheses: List[LocalizerHypothesis] = field(default_factory=list)
+    box_proposals: List[BoxProposal] = field(default_factory=list)
+    candidates: List[ProposalCandidate] = field(default_factory=list)
+    selection: Optional[SegmentationSelection] = None
 
 
 @dataclass(slots=True)
@@ -120,7 +156,7 @@ class PipelineResult:
     """User-facing pipeline result with route classification and 3D assembly."""
 
     route: str
-    target: FindingTarget
+    target: StructuredTarget
     selection: Optional[SegmentationSelection]
     volume_assembly: Optional[VolumeAssembly] = None
     candidates: List[ProposalCandidate] = field(default_factory=list)

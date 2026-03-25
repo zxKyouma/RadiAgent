@@ -3,13 +3,32 @@
 from .brain_mri import (
     DEFAULT_BRAIN_MRI_PROMPTS,
     BrainMriFindingExtractor,
+    BrainMriHeuristicLocalizer,
+    BrainMriHeuristicLocalizerConfig,
     BrainMriTextConfig,
     BrainMriTextProposalGenerator,
     BrainMriVisualConfig,
     BrainMriVisualProposalGenerator,
     HeuristicCandidateSelector,
+    MetadataWindowLocalizer,
     SamBoxRefiner,
     candidate_to_summary,
+)
+from .biomedclip_backend import (
+    BiomedClipBackendConfig,
+    BiomedClipRetrievalBackend,
+)
+from .medsiglip_backend import (
+    MedSiglipBackendConfig,
+    MedSiglipRetrievalBackend,
+)
+from .brain_mri_retrieval import (
+    BrainMriRetrievalBackend,
+    BrainMriRetrievalLocalizer,
+    BrainMriRetrievalLocalizerConfig,
+    RetrievalSlab,
+    build_slab_rgb_preview,
+    generate_retrieval_slabs,
 )
 from .brain_mri_runtime import (
     BrainMriRouteConfig,
@@ -17,9 +36,10 @@ from .brain_mri_runtime import (
     summarize_pipeline_result,
 )
 from .orchestrator import (
+    BoxProposer,
     CandidateSelector,
     FindingExtractor,
-    ProposalGenerator,
+    Localizer,
     SegmentationPipeline,
     SegmentationRefiner,
 )
@@ -32,34 +52,52 @@ from .scoring import (
 )
 from .types import (
     BoxPrompt,
+    BoxProposal,
     CandidateMetrics,
     FindingTarget,
+    LocalizerHypothesis,
     PipelineResult,
     PipelineRunArtifacts,
     ProposalCandidate,
     SegmentationSelection,
+    StructuredTarget,
     StudyContext,
     VolumeAssembly,
 )
 
 __all__ = [
     'BoxPrompt',
+    'BoxProposal',
+    'BoxProposer',
     'CandidateMetrics',
     'CandidateSelector',
     'FindingExtractor',
     'FindingTarget',
+    'Localizer',
+    'LocalizerHypothesis',
+    'MetadataWindowLocalizer',
+    'RetrievalSlab',
     'PipelineResult',
     'PipelineRunArtifacts',
     'ProposalCandidate',
-    'ProposalGenerator',
     'SegmentationPipeline',
     'SegmentationRefiner',
     'SegmentationSelection',
+    'StructuredTarget',
     'StudyContext',
     'VolumeAssembly',
     'bbox_iou',
     'DEFAULT_BRAIN_MRI_PROMPTS',
     'BrainMriFindingExtractor',
+    'BrainMriHeuristicLocalizer',
+    'BrainMriHeuristicLocalizerConfig',
+    'BiomedClipBackendConfig',
+    'MedSiglipBackendConfig',
+    'BiomedClipRetrievalBackend',
+    'MedSiglipRetrievalBackend',
+    'BrainMriRetrievalBackend',
+    'BrainMriRetrievalLocalizer',
+    'BrainMriRetrievalLocalizerConfig',
     'BrainMriRouteConfig',
     'BrainMriTextConfig',
     'BrainMriTextProposalGenerator',
@@ -69,9 +107,11 @@ __all__ = [
     'SamBoxRefiner',
     'build_pipeline_result',
     'candidate_to_summary',
+    'build_slab_rgb_preview',
     'compute_box_rerank_score',
     'summarize_pipeline_result',
     'compute_mask_metrics',
     'compute_text_rerank_score',
+    'generate_retrieval_slabs',
     'lesion_size_prior',
 ]
